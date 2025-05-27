@@ -93,6 +93,7 @@ tags, and then generate with `hack/update-toc.sh`.
     - [Retrieving a failing resource](#retrieving-a-failing-resource)
     - [Deleting a failing resource](#deleting-a-failing-resource)
     - [Protecting unconditional deletion](#protecting-unconditional-deletion)
+    - [Propagating with WATCH](#propagating-with-watch)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -405,7 +406,198 @@ deletions should therefore have their own extra admission.
 
 The unconditional deletion admission:
 1. checks if a "delete" request contains the `IgnoreStoreReadErrorWithClusterBreakingPotential` option
-2. if it does, it checks the RBAC of the request's user for the `delete-ignore-read-errors` verb of the given resource
+2. if it does, it checks the RBAC of the request's user for the `unsafe-delete-ignore-read-errors` verb of the given resource
+
+
+
+#### Propagating of WATCH Event 
+When a corrupt object is deleted with an `unsafe-delete-ignore-read-errors` option, the
+watcher of this resource will not be able to transform [1] the old data associated
+with the deleted object, or decode the old data into an object [2]. 
+
+This causes the watcher to throw an error [3]. This `error` is then converted to
+an `watch.ERROR` event [4].
+```
+{
+    type: "ERROR",
+    object: {
+      "status": {
+		"status": "Failure",
+		"code": 500,
+        "message":"<error>",
+		"reason": "InternalError"
+	 }
+  }
+}
+```
+
+The client, reflector in this case [5], receives this `watch.Error` event, 
+constructs an API `Internal` error object, and then retries the watch [6].
+
+Please note that, for a regular `watch.Deleted` event, the reflector 
+removes the deleted object from its cache [7] and then advances the 
+`ResourceVersion`.
+
+On the other hand, when it comes to an unsafe delete, the reflector never receives
+a `watch.DELETED` event, and it does not get the opportunity to remove the old 
+object from the cache, nor advance the `ResourceVersion` [7,8]. 
+
+This causes an informer backed client to keep retrying the watch with the same
+`ResourceVersion` and the deleted object stays in the informer cache.
+
+This introduces an inconsistency:
+- a) A `GET` operation in the sync loop of the client using the lister returns 
+  the delete object from the stale cache
+- b) if we issue a direct `GET` to the server it returns a `NotFound` error.
+- c) if we issue a `LIST` request to the server, the deleted object will most
+  likely be included in the response if the LIST is served from the watch cache.
+- d) If the `LIST` operation bypasses the watch cache and goes to the storage
+  then the result will not include the deleted object.
+
+
+To avoid the inconsistency issue, for Alpha we have done the following:
+When the `watcher` receives a `DELETED` event from the storage (etcd), and it 
+fails to transform or decode the old data associated with the deleted 
+resource, it returns an `ERROR` event with a `metav1.Status` object 
+with a reason `StatusReasonStoreReadError`:
+```
+{
+    type: "ERROR",
+    object: {
+      "status": {
+		"status": "Failure",
+		"code": 500,
+        "message":"corrupt object has been deleted - data from the storage is not transformable - ...",
+		"reason": "StorageReadError"
+	 }
+  }
+}
+```
+
+Upon receiving this `watch.Error` event, the reflector ends the current watch and
+restarts with a new list+watch which will result in the old cache being replaced.
+
+Pros:
+- No code changes required on the client side, existing clients will recover
+- No changes in watch API
+Cons: 
+- relisting is expensive, but it is limted to client(s) that are watching
+  the resource(s) being unsafe-deleted.
+- relisting causes the entire cache being rebuilt, for a controller the
+  sync loop will execute for every item listed.
+
+
+1: https://github.com/kubernetes/kubernetes/blob/830c76ac8300c46abfc49cf1bfe36aa1c413089f/staging/src/k8s.io/apiserver/pkg/storage/etcd3/watcher.go#L710
+2: https://github.com/kubernetes/kubernetes/blob/830c76ac8300c46abfc49cf1bfe36aa1c413089f/staging/src/k8s.io/apiserver/pkg/storage/etcd3/watcher.go#L716
+3: https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/apiserver/pkg/storage/etcd3/watcher.go#L441-L445
+4. https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/apiserver/pkg/storage/etcd3/watcher.go#L631-L638
+5. https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/client-go/tools/cache/reflector.go#L897
+6. https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/client-go/tools/cache/reflector.go#L564-L566
+7. https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/client-go/tools/cache/reflector.go#L928-L935
+8. https://github.com/kubernetes/kubernetes/blob/2f94274c88280b3b1b10a05d06f3a00964db5009/staging/src/k8s.io/client-go/tools/cache/reflector.go#L944-L946
+
+
+If total rebuilding of the cache is not desired, then we may enforce the following
+Beta criteria
+- the client avoids a re-list operation,
+- it removes the deleted object from its cache
+- it advances to the `ResourceVersion` as a result of the unsafe delete
+
+
+There are a few factors we need to consider to understan how the client is impacted:
+- a) a client that has not update yet
+- b) whether watch cache is enabled in the kube-apiserver
+
+We can review the following options:
+
+*A: Extend the `watch.ERROR` event with partial Object Metadata*:
+We will include the following details inside `Causes` when we throw the 
+`watch.ERROR` event:
+- Namespace/Name: identifies the object
+- ResourceVersion: it is the Revision of the key-value store after the Delete operation
+
+We will change the reflector to interpret this error, and do the following:
+- reconstruct a) the key (Namespace/Name)  and b) the `ResourseVersion` 
+  from `causes`, if it is present in the error.
+- delete the object from the cache using the key from `a` so the client
+  is in sync with the current state in the server storage
+- set the `LastSyncResourceVersion` to the `ResourceVersion` from `b` this 
+  advances to the revision of the storage after the delete operation
+
+This is what it would look in the wire:
+```
+{
+    type: "ERROR",
+    object: {
+      "status": {
+		"status": "Failure",
+		"code": 500,
+        "message":"corrupt object has been deleted - data from the storage is not transformable - ...",
+		"reason": "StorageReadError"
+		"details": {
+		  "causes": [
+		    {
+			  "field": "name",
+			  "message": "foo"
+			},
+		    {
+			  "field": "namespace",
+			  "message": "ns"
+			},
+		    {
+			  "field": "ResourceVersion",
+			  "message": "3"
+			},
+		  ]
+		}
+	 }
+  }
+}
+
+```
+
+Behavior: 
+- new client (that interprets the causes in this error event) recovers and 
+  catches up with the storage without a total rebuilding of its cache
+- this solution works for client that uses the Namespace+Name as the key, 
+  if a client uses a custom key this solution will not work, in this case
+  print an warning message 
+- old client behaves as it behaves today, advances by rebuilding the entire cache
+- this solution has a safe rollout for the clients, we are not forced to wait 3+ 
+  releases to reach beta
+
+
+*C: Send a `DELETED` event with a partial object of the type being watched*:
+Today the semantics of a `DELETED` event is:
+- 1) The `Object` associated with the event is the whole object as it was before deleted.
+- 2) The `ResourceVersion` of the object is the revision of the storage
+     after the delete operation.
+
+Upon faliure to transform or decode the object data, if we return a `DELETED`
+event with a partial object similar to `B` then respect `2` but not `1`.
+It's worth noting that a client can define keys based off of fields that are 
+limited to `Namespace` or `Name`, e.g. someone could define a key from a value 
+from a label or an annotation.
+
+Pros: existing clients work as expected without any code change
+Cons: partial object can cause a client that uses custom keys to fail
+
+in order for us to have a safe rollout for the clients, need to promote handling
+for this special error to locked-to-true status until every supported 
+kubelet (n-3) has the value locked-to-true before we can start enabling 
+the server-side capability. So this will take 3+ releases to reach 
+beta after we introduce this change
+
+
+*D: Introduce a new watch event*:
+<If folks want to go this route then we will expand on this>
+
+
+
+Add an integration test to show that an informer is consistent with the state 
+in the storage after the corrupt resource is unsafe-deleted.
+
+
 
 ### Test Plan
 
@@ -490,6 +682,22 @@ We expect no non-infra related flakes in the last month as a GA graduation crite
 At this time only integration tests are considered.
 
 ### Graduation Criteria
+
+#### Beta
+
+- API validation must be resilient to future additions to the API
+- unfortuately dynamic encryption config reload takes about 1m, so can't use wait.ForeverTestTimeout 
+  in the integration test yet, I have left to TODO to investigate and improve the reload time
+- Allow `DryRun` together with `ignoreStoreReadErrorWithClusterBreakingPotential`:
+  We will check if the user has the permission to do `unsafe-delete-ignore-read-errors` 
+  on the resource
+- Write a test that ensures that the order of watch Events seen by a client are 
+  preserved correctly with a series of unsafe deletes on the server.
+
+- Add more tests:
+   - https://github.com/kubernetes/kubernetes/pull/128726
+   - https://github.com/kubernetes/kubernetes/pull/129129
+
 
 <!--
 **Note:** *Not required until targeted at a release.*
